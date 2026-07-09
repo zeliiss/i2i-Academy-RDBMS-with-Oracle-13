@@ -37,37 +37,106 @@ END;
 
 -- Kitap operasyonları paket tanımı
 CREATE OR REPLACE PACKAGE BOOK_OPERATIONS AS
-    PROCEDURE add_book(p_title IN VARCHAR2, p_author_name IN VARCHAR2, p_publisher_name IN VARCHAR2);
+    FUNCTION parse_to_xml(p_raw_data IN VARCHAR2) RETURN CLOB;
+    FUNCTION parse_to_json(p_raw_data IN VARCHAR2) RETURN CLOB;
+    PROCEDURE import_books(p_xml_data IN CLOB, p_json_data IN CLOB);
+    PROCEDURE get_all_books(p_cursor OUT SYS_REFCURSOR);
 END BOOK_OPERATIONS;
 /
 
 -- Kitap operasyonları paket gövdesi
 CREATE OR REPLACE PACKAGE BODY BOOK_OPERATIONS AS
-    PROCEDURE add_book(p_title IN VARCHAR2, p_author_name IN VARCHAR2, p_publisher_name IN VARCHAR2) IS
-        v_author_id NUMBER;
-        v_publisher_id NUMBER;
+
+    -- Ayraçlı metni XML formatına çevirir
+    FUNCTION parse_to_xml(p_raw_data IN VARCHAR2) RETURN CLOB IS
+        v_xml CLOB := '<books>';
     BEGIN
-        -- Yazar kontrolü (Yoksa ekle, varsa id'sini al)
-        BEGIN
-            SELECT id INTO v_author_id FROM AUTHORS WHERE name = p_author_name;
-        EXCEPTION
-            WHEN NO_DATA_FOUND THEN
-                INSERT INTO AUTHORS (name) VALUES (p_author_name) RETURNING id INTO v_author_id;
-        END;
+        FOR i IN 1 .. REGEXP_COUNT(p_raw_data, '\|') + 1 LOOP
+            DECLARE
+                v_record VARCHAR2(4000) := REGEXP_SUBSTR(p_raw_data, '[^\|]+', 1, i);
+                v_title VARCHAR2(1000) := REGEXP_SUBSTR(v_record, '[^;]+', 1, 1);
+                v_author VARCHAR2(1000) := REGEXP_SUBSTR(v_record, '[^;]+', 1, 2);
+                v_pub VARCHAR2(1000) := REGEXP_SUBSTR(v_record, '[^;]+', 1, 3);
+            BEGIN
+                IF v_title IS NOT NULL THEN
+                    v_xml := v_xml || '<book><title>' || v_title || '</title><author>' || v_author || '</author><publisher>' || v_pub || '</publisher></book>';
+                END IF;
+            END;
+        END LOOP;
+        RETURN v_xml || '</books>';
+    END parse_to_xml;
 
-        -- Yayınevi kontrolü (Yoksa ekle, varsa id'sini al)
-        BEGIN
-            SELECT id INTO v_publisher_id FROM PUBLISHERS WHERE name = p_publisher_name;
-        EXCEPTION
-            WHEN NO_DATA_FOUND THEN
-                INSERT INTO PUBLISHERS (name) VALUES (p_publisher_name) RETURNING id INTO v_publisher_id;
-        END;
+    -- Ayraçlı metni JSON formatına çevirir
+    FUNCTION parse_to_json(p_raw_data IN VARCHAR2) RETURN CLOB IS
+        v_json CLOB := '[';
+    BEGIN
+        FOR i IN 1 .. REGEXP_COUNT(p_raw_data, '\|') + 1 LOOP
+            DECLARE
+                v_record VARCHAR2(4000) := REGEXP_SUBSTR(p_raw_data, '[^\|]+', 1, i);
+                v_title VARCHAR2(1000) := REGEXP_SUBSTR(v_record, '[^;]+', 1, 1);
+                v_author VARCHAR2(1000) := REGEXP_SUBSTR(v_record, '[^;]+', 1, 2);
+                v_pub VARCHAR2(1000) := REGEXP_SUBSTR(v_record, '[^;]+', 1, 3);
+            BEGIN
+                IF v_title IS NOT NULL THEN
+                    IF i > 1 THEN v_json := v_json || ','; END IF;
+                    v_json := v_json || '{"title":"' || v_title || '", "author":"' || v_author || '", "publisher":"' || v_pub || '"}';
+                END IF;
+            END;
+        END LOOP;
+        RETURN v_json || ']';
+    END parse_to_json;
 
-        -- Kitap kaydını oluştur
-        INSERT INTO BOOKS (title, author_id, publisher_id)
-        VALUES (p_title, v_author_id, v_publisher_id);
-        
+    -- XML ve JSON verilerini işleyerek tablolara kaydeder
+    PROCEDURE import_books(p_xml_data IN CLOB, p_json_data IN CLOB) IS
+        v_author_id NUMBER;
+        v_pub_id NUMBER;
+    BEGIN
+        FOR rec IN (
+            SELECT xt.title, xt.author, xt.publisher
+            FROM XMLTABLE('/books/book'
+                PASSING XMLTYPE(p_xml_data)
+                COLUMNS 
+                    title VARCHAR2(200) PATH 'title',
+                    author VARCHAR2(100) PATH 'author',
+                    publisher VARCHAR2(100) PATH 'publisher'
+            ) xt
+        ) LOOP
+            IF rec.title IS NULL OR rec.author IS NULL OR rec.publisher IS NULL THEN
+                RAISE_APPLICATION_ERROR(-20001, 'Eksik veri: Kitap, yazar veya yayınevi boş olamaz.');
+            END IF;
+
+            BEGIN
+                SELECT id INTO v_author_id FROM AUTHORS WHERE name = rec.author;
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    INSERT INTO AUTHORS (name) VALUES (rec.author) RETURNING id INTO v_author_id;
+            END;
+
+            BEGIN
+                SELECT id INTO v_pub_id FROM PUBLISHERS WHERE name = rec.publisher;
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    INSERT INTO PUBLISHERS (name) VALUES (rec.publisher) RETURNING id INTO v_pub_id;
+            END;
+
+            INSERT INTO BOOKS (title, author_id, publisher_id) VALUES (rec.title, v_author_id, v_pub_id);
+        END LOOP;
         COMMIT;
-    END add_book;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE_APPLICATION_ERROR(-20002, 'Veri içe aktarılırken hata oluştu: ' || SQLERRM);
+    END import_books;
+
+    -- Tüm kitap kayıtlarını cursor ile döndürür
+    PROCEDURE get_all_books(p_cursor OUT SYS_REFCURSOR) IS
+    BEGIN
+        OPEN p_cursor FOR
+            SELECT b.title, a.name AS author_name, p.name AS publisher_name
+            FROM BOOKS b
+            JOIN AUTHORS a ON b.author_id = a.id
+            JOIN PUBLISHERS p ON b.publisher_id = p.id;
+    END get_all_books;
+
 END BOOK_OPERATIONS;
 /
